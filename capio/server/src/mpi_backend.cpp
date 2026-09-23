@@ -2,6 +2,21 @@
 #include "utils/capiocl_adapter.hpp"
 #include "utils/server_println.hpp"
 
+namespace {
+// Resolving an unknown rank through operator[] would hand back an empty hostname, which
+// then resolves back to rank 0 when the reply is addressed - misrouting the reply instead
+// of reporting the problem. Every lookup goes through here so that cannot happen silently.
+const std::string &hostname_of_rank(const std::unordered_map<int, std::string> &rank_to_hostname,
+                                    const int source_rank) {
+    const auto entry = rank_to_hostname.find(source_rank);
+    if (entry == rank_to_hostname.end()) {
+        ERR_EXIT("Error: received a message from rank %d, whose hostname is not known",
+                 source_rank);
+    }
+    return entry->second;
+}
+} // namespace
+
 MPIBackend::MPIBackend(int argc, char **argv) : Backend(MPI_MAX_PROCESSOR_NAME) {
     int node_name_len, provided;
     START_LOG(gettid(), "call()");
@@ -48,6 +63,13 @@ void MPIBackend::handshake_servers() {
                      MPI_STATUS_IGNORE);
             nodes.emplace(buf.get());
             hostname_to_rank.emplace(buf.get(), i);
+            // Without this, rank_to_hostname only ever holds this server's own rank (set in
+            // the constructor). Every lookup for a remote rank then goes through
+            // operator[] and silently yields an empty string, so replies are addressed to
+            // "", send_request() resolves "" through operator[] to rank 0, and the reply is
+            // misrouted - typically back to the sender itself, which then handles a reply
+            // for a tid it never registered and dereferences a null offset pointer.
+            rank_to_hostname.emplace(i, buf.get());
         }
     }
 }
@@ -75,12 +97,18 @@ RemoteRequest MPIBackend::read_next_request() {
     MPI_Get_count(&status, MPI_CHAR, &bytes_received);
 
     LOG("receive completed!");
-    return {buff, rank_to_hostname[status.MPI_SOURCE]};
+    return {buff, hostname_of_rank(rank_to_hostname, status.MPI_SOURCE)};
 }
 void MPIBackend::send_request(const char *message, int message_len, const std::string &target) {
     START_LOG(gettid(), "call(message=%s, message_len=%d, target=%s)", message, message_len,
               target.c_str());
-    const auto mpi_target = hostname_to_rank[target];
+    // operator[] on a miss would insert the unknown target mapped to rank 0 and send the
+    // message there, silently and wrongly; fail loudly instead.
+    const auto target_entry = hostname_to_rank.find(target);
+    if (target_entry == hostname_to_rank.end()) {
+        ERR_EXIT("Error: no MPI rank known for target node \"%s\"", target.c_str());
+    }
+    const auto mpi_target = target_entry->second;
     LOG("MPI_rank for target %s is %c", target.c_str(), mpi_target);
 
     MPI_Send(message, message_len + 1, MPI_CHAR, mpi_target, 0, MPI_COMM_WORLD);
@@ -143,5 +171,5 @@ RemoteRequest MPISYNCBackend::read_next_request() {
              &status); // receive from server
 
     LOG("receive completed!");
-    return {buff, rank_to_hostname[status.MPI_SOURCE]};
+    return {buff, hostname_of_rank(rank_to_hostname, status.MPI_SOURCE)};
 }
