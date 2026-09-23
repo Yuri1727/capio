@@ -61,8 +61,13 @@ inline void handle_read_reply(int tid, int fd, long count, off64_t file_size, of
     if (is_getdents) {
         send_dirent_to_client(tid, fd, c_file, offset, bytes_read);
     } else {
-        client_manager->replyToClient(tid, offset, c_file.getBuffer(), count);
-        storage_manager->setFileOffset(tid, fd, offset + count);
+        // bytes_read (just above) is count clamped to what's actually available
+        // (end_of_sector - offset); the local read path already replies with that. This
+        // path was replying with the raw requested count instead, so the client always
+        // received a full read()-sized reply regardless of the real file size, reading
+        // uninitialized/zeroed memory past the actual data as padding.
+        client_manager->replyToClient(tid, offset, c_file.getBuffer(), bytes_read);
+        storage_manager->setFileOffset(tid, fd, offset + bytes_read);
     }
 }
 
