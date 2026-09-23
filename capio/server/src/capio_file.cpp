@@ -161,6 +161,11 @@ char *CapioFile::expandBuffer(const off64_t data_size) {
 // TODO: This is a memory leak that may lead to race conditions. remove exposure of internal buffer
 char *CapioFile::getBuffer() const { return _buf; }
 
+void CapioFile::readInto(const off64_t offset, char *dest, const off64_t count) const {
+    std::lock_guard lock(_mutex);
+    memcpy(dest, _buf + offset, count);
+}
+
 off64_t CapioFile::getBufSize() const { return _buf_size; }
 
 // TODO: This is a memory leak that may lead to race conditions. remove exposure of internal buffer

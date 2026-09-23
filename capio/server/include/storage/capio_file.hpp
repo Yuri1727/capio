@@ -209,6 +209,18 @@ class CapioFile {
     /** @return Pointer to the raw memory buffer. */
     char *getBuffer() const;
 
+    /**
+     * @brief Copies @param count bytes starting at @param offset out of the internal buffer
+     * while holding the file's mutex, so the copy cannot race with a concurrent
+     * expandBuffer() call swapping/freeing the underlying buffer on another thread.
+     * Used instead of getBuffer() + external memcpy by callers that may run concurrently
+     * with other readers of the same file (see handlers/read.hpp).
+     * @param offset offset into the file to start copying from
+     * @param dest destination buffer, must be at least @param count bytes
+     * @param count number of bytes to copy
+     */
+    void readInto(off64_t offset, char *dest, off64_t count) const;
+
     /** @return Vector of TID/FD pairs. */
     [[nodiscard]] const std::vector<std::pair<int, int>> &getFds() const;
 
