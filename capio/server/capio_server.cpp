@@ -24,10 +24,10 @@
 
 #include "client-manager/client_manager.hpp"
 #include "common/env.hpp"
-#include "common/logger.hpp"
 #include "common/requests.hpp"
 #include "common/semaphore.hpp"
 #include "remote/backend.hpp"
+#include "remote/discovery.hpp"
 #include "storage/capio_file.hpp"
 #include "utils/common.hpp"
 #include "utils/env.hpp"
@@ -36,6 +36,7 @@
 ClientManager *client_manager;
 StorageManager *storage_manager;
 Backend *backend;
+DiscoveryService *discovery_service;
 
 #include "handlers.hpp"
 #include "utils/cli_parser.hpp"
@@ -43,6 +44,9 @@ Backend *backend;
 #include "utils/signals.hpp"
 
 #include "remote/listener.hpp"
+
+#include "calf/StdOutLogger.h"
+#include "calf/StlLogger.h"
 
 /**
  * The capio_cl_engine is declared here to ensure that other components of the CAPIO server
@@ -87,8 +91,6 @@ static constexpr std::array<CSHandler_t, CAPIO_NR_REQUESTS> build_request_handle
     static const std::array<CSHandler_t, CAPIO_NR_REQUESTS> request_handlers =
         build_request_handlers_table();
 
-    START_LOG(gettid(), "call()");
-
     setup_signal_handlers();
     backend->handshake_servers();
 
@@ -98,17 +100,14 @@ static constexpr std::array<CSHandler_t, CAPIO_NR_REQUESTS> build_request_handle
 
     auto str = std::unique_ptr<char[]>(new char[CAPIO_REQ_MAX_SIZE]);
     while (true) {
-        LOG(CAPIO_LOG_SERVER_REQUEST_START);
+        START_LOG(gettid(), "call()");
         int code = client_manager->readNextRequest(str.get());
         if (code < 0 || code > CAPIO_NR_REQUESTS) {
-            server_println("Received invalid code: " + std::to_string(code),
-                           CapioCLEngine::get().getWorkflowName(), CAPIO_LOG_SERVER_CLI_LEVEL_ERROR,
-                           __func__);
+            CALF_PRINT_COLOR(CALF_CLI_LEVEL_ERROR, "Received invalid code: %d", code);
 
             ERR_EXIT("Error: received invalid request code");
         }
         request_handlers[code](str.get());
-        LOG(CAPIO_LOG_SERVER_REQUEST_END);
     }
 }
 
@@ -117,7 +116,7 @@ int main(int argc, char **argv) {
     Semaphore internal_server_sem(0);
 
     for (const auto line : CAPIO_LOG_SERVER_BANNER) {
-        server_println(line, "", "", "");
+        CALF_PRINT("%s", line);
     }
 
     const auto configuration = parseCLI(argc, argv);
@@ -134,19 +133,21 @@ int main(int argc, char **argv) {
         capio_cl_engine->setWorkflowName(get_capio_workflow_name());
     }
 
+    UPDATE_CALF_WORKFLOW_NAME(capio_cl_engine->getWorkflowName());
+
     if (configuration.store_all_in_memory) {
         capio_cl_engine->setAllStoreInMemory();
     }
 
     capio_cl_engine->print();
 
-    backend = select_backend(configuration.backend_name, argc, argv);
+    discovery_service = select_discovery_service(configuration);
+    backend           = select_backend(configuration, argc, argv);
 
     START_LOG(gettid(), "call()");
 
     open_files_location();
 
-    shm_canary      = new CapioShmCanary(capio_cl_engine->getWorkflowName());
     storage_manager = new StorageManager();
     client_manager  = new ClientManager();
 
@@ -154,11 +155,9 @@ int main(int argc, char **argv) {
     LOG("capio_server thread started");
     std::thread remote_listener_thread(capio_remote_listener, std::ref(internal_server_sem));
     LOG("capio_remote_listener thread started.");
-    server_println("Server instance successfully started!", CapioCLEngine::get().getWorkflowName(),
-                   CAPIO_LOG_SERVER_CLI_LEVEL_STATUS, "main");
+    CALF_PRINT_COLOR(CALF_CLI_LEVEL_STATUS, "Server instance successfully started!");
     server_thread.join();
     remote_listener_thread.join();
 
-    delete backend;
     return 0;
 }

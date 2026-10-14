@@ -62,29 +62,17 @@ jobs:
           
           echo "Run CAPIO syscall Unit tests"
           docker run --rm                         \
-              --env CAPIO_DIR=/tmp                \
+              --env CAPIO_DIR=/tmp/capio          \
               --env CAPIO_LOG_LEVEL=-1            \
-              --env LD_PRELOAD=libcapio_posix.so  \
+              --workdir /tmp/capio                \
               --name capio-docker                 \
               alphaunito/capio:latest             \
-            jq  -n --arg pwd $(pwd)               \
-                '{name: "CAPIO", IO_Graph: [], exclude: [$pwd + "/aNonExistingFile", $pwd, $pwd + "/"]}' \
-            > test_config.json &&                 \
-            capio_syscall_unit_tests              \
-              --gtest_break_on_failure            \
-              --gtest_print_time=1
+            sh -c 'jq -n --arg pwd "$PWD" "$1" > test_config.json && \
+               LD_PRELOAD=libcapio_posix.so capio_syscall_unit_tests \
+                 --gtest_break_on_failure \
+                 --gtest_print_time=1' sh \
+              '{name: "CAPIO", IO_Graph: [], exclude: [$pwd + "/aNonExistingFile", $pwd, $pwd + "/"]}'
           
-          echo "Run CAPIO integration tests"
-            docker run --rm                     \
-            --env CAPIO_DIR=/tmp                \
-            --env CAPIO_LOG_LEVEL=-1            \
-            --env LD_PRELOAD=libcapio_posix.so  \
-            --name capio-docker                 \
-            alphaunito/capio:latest             \
-            capio_integration_tests             \
-            --gtest_break_on_failure            \
-            --gtest_print_time=1
-
   format-check:
     name: "Check ${{ matrix.path }} clang-format conformance"
     runs-on: ubuntu-24.04
@@ -112,24 +100,22 @@ jobs:
           - Debug
           - Release
         compiler:
-          - gcc:9
-          - gcc:10
-          - gcc:11
           - gcc:12
           - gcc:13
           - gcc:14
           - gcc:15
           - gcc:16
-          - zhongruoyu/llvm-ports:13.0-trixie
-          - zhongruoyu/llvm-ports:14.0-trixie
-          - zhongruoyu/llvm-ports:15.0-trixie
-          - zhongruoyu/llvm-ports:16.0-trixie
-          - zhongruoyu/llvm-ports:17.0-trixie
+          - zhongruoyu/llvm-ports:13-trixie
+          - zhongruoyu/llvm-ports:14-trixie
+          - zhongruoyu/llvm-ports:15-trixie
+          - zhongruoyu/llvm-ports:16-trixie
+          - zhongruoyu/llvm-ports:17-trixie
           - zhongruoyu/llvm-ports:18-trixie
-          - zhongruoyu/llvm-ports:19.1-bullseye
-          - zhongruoyu/llvm-ports:20.1-bullseye
-          - zhongruoyu/llvm-ports:21.1-bullseye
-
+          - zhongruoyu/llvm-ports:19-trixie
+          - zhongruoyu/llvm-ports:20-trixie
+          - zhongruoyu/llvm-ports:21-trixie
+          - zhongruoyu/llvm-ports:22-trixie
+          - zhongruoyu/llvm-ports:23-trixie
     container:
       image: ${{ matrix.compiler }}
 
@@ -139,43 +125,55 @@ jobs:
       - name: "Install gfortran (OpenMPI dependency)"
         if: ${{ startsWith(matrix.compiler, 'gcc:') }}
         run: |
-          apt update
+          apt update -o Acquire::Check-Valid-Until=false
           apt install -y gfortran || true
           update-alternatives --install /usr/bin/gfortran gfortran /usr/bin/gfortran-* 100
 
       - name: "Install packages"
-        run: |
-          apt update
-          apt install -y      \
-            openmpi-bin       \
-            libopenmpi-dev    \
-            ninja-build       \
-            cmake             \
-            make              \
-            sudo              \
-            bash              \
-            git               \
-            jq                \
-            pkg-config        \
-            build-essential   \
-            wget              \
-            tar               \
-            python3           \
-            python3-pip       \
-            python3-venv
+        uses: nick-fields/retry@v4
+        with:
+          command: |
+            apt update
+            apt install -y      \
+              openmpi-bin       \
+              libopenmpi-dev    \
+              ninja-build       \
+              cmake             \
+              make              \
+              sudo              \
+              bash              \
+              git               \
+              jq                \
+              pkg-config        \
+              libprotobuf-dev   \
+              protobuf-compiler \
+              build-essential   \
+              wget              \
+              tar               \
+              python3           \
+              python3-pip       \
+              python3-venv
+          max_attempts: 3
+          retry_wait_seconds: 10
+          timeout_minutes: 10
 
       - name: "Run CMake"
-        shell: bash
-        run: |
-          cmake -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-                -DCAPIO_LOG=${{ matrix.build_type == 'Debug' && 'ON' || 'OFF' }} \
-                -DENABLE_COVERAGE=${{ matrix.build_type == 'Debug' && 'ON' || 'OFF' }} \
-                -DCAPIO_BUILD_TESTS=ON \
-                -G Ninja \
-                -B ../build \
-                -S ${GITHUB_WORKSPACE}
-          cmake --build ../build -j $(nproc)
-          sudo cmake --install ../build --prefix /usr/local
+        uses: nick-fields/retry@v4
+        with:
+          command: |
+            cmake -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+                  -DCAPIO_LOG=${{ matrix.build_type == 'Debug' && 'ON' || 'OFF' }} \
+                  -DENABLE_COVERAGE=${{ matrix.build_type == 'Debug' && 'ON' || 'OFF' }} \
+                  -DCAPIO_BUILD_TESTS=ON \
+                  -G Ninja \
+                  -B ../build \
+                  -S ${GITHUB_WORKSPACE}
+            cmake --build ../build -j $(nproc)
+            sudo cmake --install ../build --prefix /usr/local
+          max_attempts: 3
+          retry_wait_seconds: 10
+          timeout_minutes: 30
+
       - name: "Run tests"
         id: run-tests
         shell: bash
@@ -208,19 +206,31 @@ jobs:
           capio_syscall_unit_tests \
             --gtest_break_on_failure \
             --gtest_print_time=1
-          
-          echo "Run CAPIO integration tests"
-          rm -rf /dev/shm/CAPIO*
-          LD_PRELOAD=libcapio_posix.so \
-          capio_integration_tests \
-            --gtest_break_on_failure \
-            --gtest_print_time=1
-      - name: "Show client logs on failure"
-        if: ${{ always() && steps.run-tests.outcome == 'failure' && matrix.build_type == 'Debug' }}
-        run: tail -v -n +1 capio_logs/posix/$(hostname)/posix_thread_*.log
-      - name: "Show server logs on failure"
-        if: ${{ always() && steps.run-tests.outcome == 'failure' && matrix.build_type == 'Debug' }}
-        run: tail -v -n +1 capio_logs/server/$(hostname)/server_thread_*.log
+
+      # note: use always() to force log upload also on test failure
+      - name: "Compute valid artifact name"
+        if: ${{ always() && matrix.build_type == 'Debug' }}
+        id: calc-name
+        run: |
+          CLEAN_NAME=$(echo "${{ matrix.compiler }}" | tr '/:.' '-' | sed 's/--/-/g')
+          echo "artifact_name=${CLEAN_NAME}" >> $GITHUB_OUTPUT
+
+      - name: "Prepare CAPIO logs"
+        if: ${{ always() && matrix.build_type == 'Debug' }}
+        run: |
+          if [ -d capio_logs ]; then
+            mkdir capio_logs_artifact
+            cp -a capio_logs capio_logs_artifact/
+          fi
+
+      - name: "Upload CAPIO logs"
+        if: ${{ always() && matrix.build_type == 'Debug' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.calc-name.outputs.artifact_name }}-logs
+          path: ./capio_logs_artifact
+          retention-days: 1
+          if-no-files-found: warn
 
       - name: "Generate coverage report"
         if: ${{ matrix.build_type == 'Debug' }}
@@ -236,32 +246,66 @@ jobs:
             --gcov-ignore-parse-errors=negative_hits.warn \
             ../build
 
-      - name: "Compute Valid Artifact Name"
-        if: ${{ matrix.build_type == 'Debug' }}
-        id: calc-name
-        run: |
-          CLEAN_NAME=$(echo "${{ matrix.compiler }}" | tr '/:.' '-' | sed 's/--/-/g')
-          echo "artifact_name=${CLEAN_NAME}-tests" >> $GITHUB_OUTPUT
-
       - name: "Upload coverage report"
         if: ${{ matrix.build_type == 'Debug' }}
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.calc-name.outputs.artifact_name }}
+          name: ${{ steps.calc-name.outputs.artifact_name }}-tests
           path: ./coverage.xml
+          retention-days: 1
+          if-no-files-found: error
+
+  multinode-tests:
+    name: "Backend multinode test with MTCL"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: "Build test image"
+        run: |
+          docker build \
+            --build-arg CAPIO_BUILD_TESTS=ON \
+            --build-arg CMAKE_BUILD_TYPE=Debug \
+            --build-arg ENABLE_COVERAGE=ON \
+            --target coverage \
+            --tag alphaunito/capio:multinode .
+      - name: "Run MTCL multinode test"
+        working-directory: capio/tests/integration
+        run: |
+          trap 'docker compose down -v' EXIT
+          status=0
+          docker compose up --abort-on-container-failure || status=$?
+          mkdir -p coverage
+          copy_status=0
+          for node in split map merge; do
+            docker compose cp "${node}:/coverage/${node}.xml" "coverage/${node}.xml" || copy_status=1
+          done
+          test -s coverage/split.xml || copy_status=1
+          test -s coverage/map.xml || copy_status=1
+          test -s coverage/merge.xml || copy_status=1
+          [ "$status" -eq 0 ] || exit "$status"
+          exit "$copy_status"
+      - name: "Upload multinode coverage report"
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: multinode-tests
+          path: capio/tests/integration/coverage/*.xml
           retention-days: 1
           if-no-files-found: error
 
   upload-to-codecov:
     name: "Codecov report upload"
-    needs: [ "unit-tests" , "codespell-check" , "format-check" ]
+    needs: [ "unit-tests" , "multinode-tests" , "codespell-check" , "format-check" ]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: "Download artifacts"
         uses: actions/download-artifact@v8
-      - name: "Upload coverage to Codecov"
-        uses: codecov/codecov-action@v6
         with:
+          pattern: "*-tests"
+      - name: "Upload coverage to Codecov"
+        uses: codecov/codecov-action@v7
+        with:
+          files: ./multinode-tests/split.xml,./multinode-tests/map.xml,./multinode-tests/merge.xml
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}

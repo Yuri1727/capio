@@ -1,21 +1,13 @@
 #include "remote/backend/mpi.hpp"
-#include "utils/capiocl_adapter.hpp"
-#include "utils/server_println.hpp"
 
-namespace {
-// Resolving an unknown rank through operator[] would hand back an empty hostname, which
-// then resolves back to rank 0 when the reply is addressed - misrouting the reply instead
-// of reporting the problem. Every lookup goes through here so that cannot happen silently.
-const std::string &hostname_of_rank(const std::unordered_map<int, std::string> &rank_to_hostname,
-                                    const int source_rank) {
-    const auto entry = rank_to_hostname.find(source_rank);
-    if (entry == rank_to_hostname.end()) {
-        ERR_EXIT("Error: received a message from rank %d, whose hostname is not known",
-                 source_rank);
-    }
-    return entry->second;
-}
-} // namespace
+#include "calf/StdOutLogger.h"
+#include "calf/StlLogger.h"
+
+#include "common/constants.hpp"
+#include "utils/capiocl_adapter.hpp"
+
+#include <algorithm>
+#include <vector>
 
 MPIBackend::MPIBackend(int argc, char **argv) : Backend(MPI_MAX_PROCESSOR_NAME) {
     int node_name_len, provided;
@@ -37,15 +29,13 @@ MPIBackend::MPIBackend(int argc, char **argv) : Backend(MPI_MAX_PROCESSOR_NAME) 
     nodes.emplace(node_name);
     rank_to_hostname[rank]      = node_name;
     hostname_to_rank[node_name] = rank;
-    server_println("initialization completed.", CapioCLEngine::get().getWorkflowName(),
-                   CAPIO_LOG_SERVER_CLI_LEVEL_STATUS, "MPIBackend");
+    CALF_PRINT_COLOR(CALF_CLI_LEVEL_STATUS, "initialization completed.");
 }
 
 MPIBackend::~MPIBackend() {
     START_LOG(gettid(), "Call()");
     MPI_Finalize();
-    server_println("teardown completed.", CapioCLEngine::get().getWorkflowName(),
-                   CAPIO_LOG_SERVER_CLI_LEVEL_INFO, "MPIBackend");
+    CALF_PRINT_COLOR(CALF_CLI_LEVEL_INFO, "teardown completed.");
 }
 
 const std::set<std::string> MPIBackend::get_nodes() { return nodes; }
@@ -53,24 +43,19 @@ const std::set<std::string> MPIBackend::get_nodes() { return nodes; }
 void MPIBackend::handshake_servers() {
     START_LOG(gettid(), "call()");
 
-    auto buf = std::unique_ptr<char[]>(new char[MPI_MAX_PROCESSOR_NAME]);
+    std::vector local_name(MPI_MAX_PROCESSOR_NAME, '\0');
+    std::copy(node_name.begin(), node_name.end(), local_name.begin());
+    std::vector names(n_servers * MPI_MAX_PROCESSOR_NAME, '\0');
+
+    MPI_Allgather(local_name.data(), MPI_MAX_PROCESSOR_NAME, MPI_CHAR, names.data(),
+                  MPI_MAX_PROCESSOR_NAME, MPI_CHAR, MPI_COMM_WORLD);
+
     for (int i = 0; i < n_servers; i += 1) {
-        if (i != rank) {
-            // TODO: possible deadlock
-            MPI_Send(node_name.c_str(), node_name.length(), MPI_CHAR, i, 0, MPI_COMM_WORLD);
-            std::fill(buf.get(), buf.get() + MPI_MAX_PROCESSOR_NAME, 0);
-            MPI_Recv(buf.get(), MPI_MAX_PROCESSOR_NAME, MPI_CHAR, i, 0, MPI_COMM_WORLD,
-                     MPI_STATUS_IGNORE);
-            nodes.emplace(buf.get());
-            hostname_to_rank.emplace(buf.get(), i);
-            // Without this, rank_to_hostname only ever holds this server's own rank (set in
-            // the constructor). Every lookup for a remote rank then goes through
-            // operator[] and silently yields an empty string, so replies are addressed to
-            // "", send_request() resolves "" through operator[] to rank 0, and the reply is
-            // misrouted - typically back to the sender itself, which then handles a reply
-            // for a tid it never registered and dereferences a null offset pointer.
-            rank_to_hostname.emplace(i, buf.get());
-        }
+        const auto begin = names.begin() + i * MPI_MAX_PROCESSOR_NAME;
+        const std::string hostname(begin, std::find(begin, begin + MPI_MAX_PROCESSOR_NAME, '\0'));
+        nodes.emplace(hostname);
+        hostname_to_rank[hostname] = i;
+        rank_to_hostname[i]        = hostname;
     }
 }
 
@@ -97,27 +82,25 @@ RemoteRequest MPIBackend::read_next_request() {
     MPI_Get_count(&status, MPI_CHAR, &bytes_received);
 
     LOG("receive completed!");
-    return {buff, hostname_of_rank(rank_to_hostname, status.MPI_SOURCE)};
+    return {buff, rank_to_hostname[status.MPI_SOURCE]};
 }
 void MPIBackend::send_request(const char *message, int message_len, const std::string &target) {
     START_LOG(gettid(), "call(message=%s, message_len=%d, target=%s)", message, message_len,
               target.c_str());
-    // operator[] on a miss would insert the unknown target mapped to rank 0 and send the
-    // message there, silently and wrongly; fail loudly instead.
-    const auto target_entry = hostname_to_rank.find(target);
-    if (target_entry == hostname_to_rank.end()) {
-        ERR_EXIT("Error: no MPI rank known for target node \"%s\"", target.c_str());
-    }
-    const auto mpi_target = target_entry->second;
+    const auto mpi_target = hostname_to_rank[target];
     LOG("MPI_rank for target %s is %c", target.c_str(), mpi_target);
 
     MPI_Send(message, message_len + 1, MPI_CHAR, mpi_target, 0, MPI_COMM_WORLD);
 }
 
-void MPIBackend::send_file(char *shm, long int nbytes, const std::string &target) {
-    START_LOG(gettid(), "call(%.50s, %ld, %s)", shm, nbytes, target.c_str());
+void MPIBackend::send_file(const char *message, const int message_len, char *shm,
+                           const long int nbytes, const std::string &target) {
+    START_LOG(gettid(), "call(%s, %d, %.50s, %ld, %s)", message, message_len, shm, nbytes,
+              target.c_str());
     int elem_to_snd = 0;
     int dest        = hostname_to_rank[target];
+
+    MPI_Send(message, message_len + 1, MPI_CHAR, dest, 0, MPI_COMM_WORLD);
     for (long int k = 0; k < nbytes; k += elem_to_snd) {
         // Compute the maximum amount to send for this chunk
         elem_to_snd = static_cast<int>(std::min(nbytes - k, MPI_MAX_ELEM_COUNT));
@@ -128,7 +111,7 @@ void MPIBackend::send_file(char *shm, long int nbytes, const std::string &target
     }
 }
 
-void MPIBackend::recv_file(char *shm, const std::string &source, long int bytes_expected) {
+void MPIBackend::recv_file(char *shm, long int bytes_expected, const std::string &source) {
     START_LOG(gettid(), "call(shm=%ld, source=%s, bytes_expected=%ld)", shm, source.c_str(),
               bytes_expected);
     MPI_Status status;
@@ -147,19 +130,18 @@ void MPIBackend::recv_file(char *shm, const std::string &source, long int bytes_
         LOG("Chunk size is %ld bytes", bytes_received);
     }
 }
+void MPIBackend::connect_to(const std::string &target) { return; }
 
 MPISYNCBackend::MPISYNCBackend(int argc, char *argv[]) : MPIBackend(argc, argv) {
     START_LOG(gettid(), "call()");
     LOG("Wrapped MPI backend with MPISYC backend");
-    server_println("initialization completed.", CapioCLEngine::get().getWorkflowName(),
-                   CAPIO_LOG_SERVER_CLI_LEVEL_STATUS, "MPISYNCBackend");
+    CALF_PRINT_COLOR(CALF_CLI_LEVEL_STATUS, "initialization completed.");
 }
 
 MPISYNCBackend::~MPISYNCBackend() {
     START_LOG(gettid(), "Call()");
     MPI_Finalize();
-    server_println("teardown completed.", CapioCLEngine::get().getWorkflowName(),
-                   CAPIO_LOG_SERVER_CLI_LEVEL_INFO, "MPISYNCBackend");
+    CALF_PRINT_COLOR(CALF_CLI_LEVEL_INFO, "teardown completed.");
 }
 
 RemoteRequest MPISYNCBackend::read_next_request() {
@@ -171,5 +153,5 @@ RemoteRequest MPISYNCBackend::read_next_request() {
              &status); // receive from server
 
     LOG("receive completed!");
-    return {buff, hostname_of_rank(rank_to_hostname, status.MPI_SOURCE)};
+    return {buff, rank_to_hostname[status.MPI_SOURCE]};
 }
