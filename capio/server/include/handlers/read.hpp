@@ -35,18 +35,14 @@ inline void handle_pending_read(int tid, int fd, long int process_offset, long i
 
     c_file.createBuffer(path, false);
     // Concurrent readers of the same on_close file are woken up together by setCommitted()'s
-    // notify_all() and race to read the shared buffer here; readInto() copies under c_file's
-    // own lock instead of exposing the raw pointer via getBuffer(), so this can't race with a
-    // concurrent expandBuffer() on another reader's thread (see capio_file.cpp comment on
-    // getBuffer() for the race this avoids).
-    // replyToClient(tid, offset, buf, count) indexes as buf+offset, i.e. it expects buf to be
-    // the full file buffer starting at absolute offset 0 (that's what getBuffer() used to hand
-    // it directly). So the locked copy must cover [0, process_offset+bytes_read), not just the
-    // [process_offset, process_offset+bytes_read) slice - otherwise buf+offset here reads out
-    // of bounds of a too-small tmp buffer whenever process_offset != 0.
-    std::vector<char> tmp(process_offset + bytes_read);
-    c_file.readInto(0, tmp.data(), process_offset + bytes_read);
-    client_manager->replyToClient(tid, process_offset, tmp.data(), bytes_read);
+    // notify_all() and race on the shared buffer here: copy only the requested slice under
+    // c_file's lock (readInto) instead of exposing the raw getBuffer() pointer, then send that
+    // slice. Copying just [process_offset, process_offset + bytes_read) keeps each request
+    // O(bytes_read); copying the whole prefix from offset 0 made sequential reads of a file
+    // quadratic in its size.
+    std::vector<char> tmp(bytes_read);
+    c_file.readInto(process_offset, tmp.data(), bytes_read);
+    client_manager->replyToClientData(tid, process_offset, tmp.data(), bytes_read);
     storage_manager->setFileOffset(tid, fd, process_offset + bytes_read);
 
     // TODO: check if the file was moved to the disk
@@ -101,12 +97,10 @@ inline void handle_local_read(int tid, int fd, off64_t count, bool is_prod) {
     LOG("Requested read within end of sector, and data is available. Serving %ld bytes", read_size);
 
     c_file.createBuffer(path, false);
-    // Same race as in handle_pending_read() above: this path is reachable concurrently by
-    // multiple readers once the file is already committed, so copy under c_file's lock rather
-    // than using the raw getBuffer() pointer.
-    std::vector<char> tmp(process_offset + read_size);
-    c_file.readInto(0, tmp.data(), process_offset + read_size);
-    client_manager->replyToClient(tid, process_offset, tmp.data(), read_size);
+    // Same race and same fix as in handle_pending_read() above.
+    std::vector<char> tmp(read_size);
+    c_file.readInto(process_offset, tmp.data(), read_size);
+    client_manager->replyToClientData(tid, process_offset, tmp.data(), read_size);
     storage_manager->setFileOffset(tid, fd, process_offset + read_size);
 }
 

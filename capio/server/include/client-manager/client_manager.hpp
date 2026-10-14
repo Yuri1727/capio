@@ -101,6 +101,17 @@ class ClientManager {
     void replyToClient(int tid, off64_t offset, char *buf, off64_t count);
 
     /**
+     * Like replyToClient(tid, offset, buf, count), but @param data points directly at the
+     * @param count bytes to send (the slice starting at file offset @param offset), not at the
+     * start of the whole file buffer.
+     * @param tid
+     * @param offset
+     * @param data
+     * @param count
+     */
+    void replyToClientData(int tid, off64_t offset, const char *data, off64_t count);
+
+    /**
      * Send an offset as a reply to a request to a connected client
      * @param tid
      * @param offset
